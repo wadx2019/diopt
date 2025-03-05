@@ -1,0 +1,11 @@
+{
+    "tol": 1e-6,
+    "max_iter": 10,
+    "print_level": 0,
+    "mu_init": 0.01,
+    "max_soc": 8,
+    "alpha_red_factor": 0.1,
+    "mu_strategy": "adaptive",
+    "nlp_scaling_method": "gradient-based"
+}
+
