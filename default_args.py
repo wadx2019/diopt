@@ -19,6 +19,7 @@ def baseline_opt_default_args(prob_type):
     return defaults
 
 def baseline_nn_default_args(prob_type):
+
     defaults = {}
     defaults['simpleVar'] = 100
     defaults['simpleIneq'] = 50
@@ -30,6 +31,12 @@ def baseline_nn_default_args(prob_type):
     defaults['nonconvexEx'] = 10000
     defaults['saveAllStats'] = True
     defaults['resultsSaveFreq'] = 50
+    defaults['PowerVar'] = 20
+    defaults['PowerEx'] = 10000
+    defaults['RetargetVar'] = 19
+    defaults['RetargetEx'] = 1836
+    defaults['RetargetEq'] = 0
+    defaults['RetargetIneq'] = 38
 
     if prob_type == 'simple':
         defaults['epochs'] = 1000
@@ -66,6 +73,30 @@ def baseline_nn_default_args(prob_type):
         defaults['corrTestMaxSteps'] = 5
         defaults['corrEps'] = 1e-4
         defaults['corrLr'] = 1e-5
+        defaults['corrMomentum'] = 0.5
+    elif prob_type == 'Retargeting':
+        defaults['epochs'] = 1000
+        defaults['batchSize'] = 200
+        defaults['lr'] = 1e-4
+        defaults['hiddenSize'] = 200
+        defaults['softWeight'] = 100  # use 100 if useCompl=False
+        defaults['softWeightEqFrac'] = 0.5
+        defaults['useTestCorr'] = False
+        defaults['corrTestMaxSteps'] = 10
+        defaults['corrEps'] = 1e-4
+        defaults['corrLr'] = 1e-7
+        defaults['corrMomentum'] = 0.5
+    elif prob_type == 'PowerAllocation':
+        defaults['epochs'] = 1000
+        defaults['batchSize'] = 200
+        defaults['lr'] = 1e-4
+        defaults['hiddenSize'] = 200
+        defaults['softWeight'] = 100  # use 100 if useCompl=False
+        defaults['softWeightEqFrac'] = 0.5
+        defaults['useTestCorr'] = False
+        defaults['corrTestMaxSteps'] = 10
+        defaults['corrEps'] = 1e-4
+        defaults['corrLr'] = 1e-7
         defaults['corrMomentum'] = 0.5
     else:
         raise NotImplementedError
@@ -138,6 +169,12 @@ def method_default_args(prob_type):
     defaults['nonconvexEx'] = 10000
     defaults['saveAllStats'] = True
     defaults['resultsSaveFreq'] = 50
+    defaults['PowerVar'] = 20
+    defaults['PowerEx'] = 10000
+    defaults['RetargetVar'] = 19
+    defaults['RetargetEx'] = 1836
+    defaults['RetargetEq'] = 0
+    defaults['RetargetIneq'] = 38
 
     if prob_type == 'simple':
         defaults['epochs'] = 1000
@@ -171,11 +208,112 @@ def method_default_args(prob_type):
         defaults['corrEps'] = 1e-4
         defaults['corrLr'] = 1e-7
         defaults['corrMomentum'] = 0.5
+    elif prob_type == 'Retargeting':
+        defaults['epochs'] = 1000
+        defaults['batchSize'] = 200
+        defaults['lr'] = 1e-4
+        defaults['hiddenSize'] = 200
+        defaults['softWeight'] = 100  # use 100 if useCompl=False
+        defaults['softWeightEqFrac'] = 0.5
+        defaults['useCompl'] = False
+        defaults['useTrainCorr'] = True
+        defaults['useTestCorr'] = True
+        defaults['corrMode'] = 'full'  # use 'full' if useCompl=False
+        defaults['corrTrainSteps'] = 10
+        defaults['corrTestMaxSteps'] = 10
+        defaults['corrEps'] = 1e-4
+        defaults['corrLr'] = 1e-7
+        defaults['corrMomentum'] = 0.5
+    elif prob_type == 'PowerAllocation':
+        defaults['epochs'] = 1000
+        defaults['batchSize'] = 200
+        defaults['lr'] = 1e-4
+        defaults['hiddenSize'] = 200
+        defaults['softWeight'] = 100  # use 100 if useCompl=False
+        defaults['softWeightEqFrac'] = 0.5
+        defaults['useCompl'] = False
+        defaults['useTrainCorr'] = True
+        defaults['useTestCorr'] = True
+        defaults['corrMode'] = 'full'  # use 'full' if useCompl=False
+        defaults['corrTrainSteps'] = 10
+        defaults['corrTestMaxSteps'] = 10
+        defaults['corrEps'] = 1e-4
+        defaults['corrLr'] = 1e-7
+        defaults['corrMomentum'] = 0.5
     elif 'acopf' in prob_type:
-        defaults['epochs'] = 5000
+        defaults['epochs'] = 10000
         defaults['batchSize'] = 200
         defaults['lr'] = 1e-3
         defaults['hiddenSize'] = 200
+        defaults['softWeight'] = 10             # use 100 if useCompl=False
+        defaults['softWeightEqFrac'] = 0.5
+        defaults['useCompl'] = True
+        defaults['useTrainCorr'] = True
+        defaults['useTestCorr'] = True
+        defaults['corrMode'] = 'partial'    # use 'full' if useCompl=False
+        defaults['corrTrainSteps'] = 5
+        defaults['corrTestMaxSteps'] = 5
+        defaults['corrEps'] = 1e-4
+        defaults['corrLr'] = 1e-4           # use 1e-5 if useCompl=False
+        defaults['corrMomentum'] = 0.5
+    else:
+        raise NotImplementedError
+
+    return defaults
+
+def baseline_mbd_default_args(prob_type):
+    defaults = {}
+    defaults['lambda_h'] = 10.0
+    defaults['lambda_g'] = 10.0
+    defaults['Nsample'] = 64
+    defaults['simpleVar'] = 100
+    defaults['simpleIneq'] = 50
+    defaults['simpleEq'] = 50
+    defaults['simpleEx'] = 10000
+    defaults['nonconvexVar'] = 100
+    defaults['nonconvexIneq'] = 50
+    defaults['nonconvexEq'] = 50
+    defaults['nonconvexEx'] = 10000
+    defaults['saveAllStats'] = True
+    defaults['resultsSaveFreq'] = 50
+
+    if prob_type == 'simple':
+        defaults['epochs'] = 1000
+        defaults['batchSize'] = 200
+        # defaults['lr'] = 1e-4
+        # defaults['hiddenSize'] = 200
+        defaults['softWeight'] = 10          # use 100 if useCompl=False
+        defaults['softWeightEqFrac'] = 0.5
+        defaults['useCompl'] = True
+        defaults['useTrainCorr'] = True
+        defaults['useTestCorr'] = True
+        defaults['corrMode'] = 'partial'    # use 'full' if useCompl=False
+        defaults['corrTrainSteps'] = 10
+        defaults['corrTestMaxSteps'] = 10
+        defaults['corrEps'] = 1e-4
+        defaults['corrLr'] = 1e-7
+        defaults['corrMomentum'] = 0.5
+    elif prob_type == 'nonconvex':
+        defaults['epochs'] = 1000
+        defaults['batchSize'] = 200
+        # defaults['lr'] = 1e-4
+        # defaults['hiddenSize'] = 200
+        defaults['softWeight'] = 10          # use 100 if useCompl=False
+        defaults['softWeightEqFrac'] = 0.5
+        defaults['useCompl'] = True
+        defaults['useTrainCorr'] = True
+        defaults['useTestCorr'] = True
+        defaults['corrMode'] = 'partial'    # use 'full' if useCompl=False
+        defaults['corrTrainSteps'] = 10
+        defaults['corrTestMaxSteps'] = 10
+        defaults['corrEps'] = 1e-4
+        defaults['corrLr'] = 1e-7
+        defaults['corrMomentum'] = 0.5
+    elif 'acopf' in prob_type:
+        defaults['epochs'] = 10000
+        defaults['batchSize'] = 200
+        # defaults['lr'] = 1e-3
+        # defaults['hiddenSize'] = 200
         defaults['softWeight'] = 10             # use 100 if useCompl=False
         defaults['softWeightEqFrac'] = 0.5
         defaults['useCompl'] = True
