@@ -1324,3 +1324,1051 @@ def PFFunction(data, tol=1e-3, bsz=200, max_iters=5):
 
 
     return PFFunctionFn.apply
+
+###############################################
+#####   RETARGETING PRO########################
+###############################################
+
+import torch
+import torch.nn as nn
+from torch.autograd import Function
+torch.set_default_dtype(torch.float64)
+import torch.functional as F
+
+import numpy as np
+import osqp
+from qpth.qp import QPFunction
+import ipopt
+import cyipopt
+from scipy.linalg import svd
+from scipy.sparse import csc_matrix
+
+import hashlib
+from copy import deepcopy
+import scipy.io as spio
+import time
+
+from pypower.api import case57
+from pypower.api import opf, makeYbus
+from pypower import idx_bus, idx_gen, ppoption
+
+import pandas as pd
+from phc.utils.torch_h1_humanoid_batch import Humanoid_Batch
+from phc.smpllib.smpl_parser import (
+    SMPL_Parser,
+    SMPLH_Parser,
+    SMPLX_Parser,
+    SMPL_BONE_ORDER_NAMES,
+)
+
+DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+
+
+
+def str_to_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value.lower() in {'false', 'f', '0', 'no', 'n'}:
+        return False
+    elif value.lower() in {'true', 't', '1', 'yes', 'y'}:
+        return True
+    raise ValueError('{value} is not a valid boolean value')
+
+def my_hash(string):
+    return hashlib.sha1(bytes(string, 'utf-8')).hexdigest()
+
+###############################################
+#####   RETARGETING PRO########################
+###############################################
+
+import torch
+import torch.nn as nn
+from torch.autograd import Function
+torch.set_default_dtype(torch.float64)
+
+import numpy as np
+import osqp
+from qpth.qp import QPFunction
+import ipopt
+import cyipopt
+from scipy.sparse import csc_matrix
+
+import hashlib
+from copy import deepcopy
+import scipy.io as spio
+import time
+
+from pypower.api import opf, makeYbus
+from pypower import idx_bus, idx_gen, ppoption
+
+from phc.utils.torch_h1_humanoid_batch import Humanoid_Batch
+
+DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+class Retargeting_h1:
+    def __init__(self, R, R_root, R_root_trans, h1_joint_pick_idx):
+        self.R = torch.tensor(R)
+        self.R_root = torch.tensor(R_root)
+        self.R_root_trans = torch.tensor(R_root_trans)
+        self.h1_joint_pick_idx = h1_joint_pick_idx
+        self.frames = R_root.shape[0]
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def forward_kinematics(self, Y):
+        h1_fk = Humanoid_Batch(device=self.device)
+        # print('1', self.R_root[None, :, None].shape)
+        # print('2', (self.R * Y).shape)
+        # print('4', torch.zeros((1, self.frames, 2, 3)).shape)
+        pose_aa_h1 = torch.cat([ self.R_root[None, :, None].to(self.device), (self.R * Y).to(self.device), torch.zeros((1, self.frames, 2, 3), device=self.device),], axis=2,).to(self.device)
+
+        return h1_fk.fk_batch(pose_aa_h1.to(torch.float32), self.R_root_trans[None,].to(torch.float32).to(self.device))
+
+    # def loss(self, X, Y):
+    #     loss = (self.forward_kinematics(Y)["global_translation_extend"][:, :,
+    #             self.h1_joint_pick_idx] - X.to(self.device))
+    #     loss = loss.norm(dim=-1).sum(dim=-1).view(-1,1)
+    #     num = loss.numel()
+    #     if num == 1:
+    #         loss.backward()
+    #         return loss, Y.grad
+    #     else:
+    #         return loss, None
+
+    def loss(self, X, Y):
+        loss = (self.forward_kinematics(Y)["global_translation_extend"][:, :,
+                self.h1_joint_pick_idx] - X.to(self.device))
+        loss = loss.norm(dim=-1).sum(dim=-1).view(-1,1)
+
+        return loss
+
+    def grad(self, X, Y):
+        if Y.grad is not None:
+            Y.grad.zero_()
+        loss = self.loss(X, Y)
+        loss.backward()
+        return Y.grad
+
+
+class RetargetingProblem:
+    def __init__(self, filename, valid_frac=0.0833, test_frac=0.0833):
+        # self._X = torch.tensor(X)
+        # self._G = torch.tensor(G)
+        # self._h = torch.tensor(h)
+        # self._R = torch.tensor(R)
+        # self._R_root = torch.tensor(R_root)
+        # self._R_root_trans = torch.tensor(R_root_trans)
+
+        data = torch.load(filename)
+        ones_vector = torch.vstack([-torch.ones(19, 1), torch.ones(19, 1)])
+        self._X = data['X']
+        self._G = data['G']
+        self._h = data['h']*ones_vector
+        self._R = data['R']
+        self._Y = data['Y']
+        self._R_root = data['R_root']
+        self._R_root_trans = data['R_root_trans']
+        self.idx = [0, 4, 5, 9, 10, 13, 15, 20, 17, 19, 21]
+
+        # self.idx = idx
+        # self._Y = None
+        # self._xdim = self._X.shape[1]
+        self._xdim =  torch.cat((self._X, self._R_root, self._R_root_trans), dim=1).shape[1]
+        self._ydim = self._G.shape[1]
+        self._num = self._X.shape[0]
+        self._neq = 0
+        self._nineq = self._G.shape[0] + 1
+
+        self._nknowns = 0
+        self._valid_frac = valid_frac
+        self._test_frac = test_frac
+        self.solver_type = 'ipopt'
+
+        self.total_cost = 2.0
+
+        self._partial_vars = np.arange(self.ydim)
+        self._other_vars = np.setdiff1d(np.arange(self.ydim), self._partial_vars)
+        self._partial_unknown_vars = np.setdiff1d(np.arange(self.ydim), self._partial_vars)
+
+
+        det = 0
+        # self.solver_type = 'lagrange'
+        # self.solver_type = 'waterfilling'
+
+        ### For Pytorch
+        self._device = None
+
+    def __str__(self):
+        return 'RetargetingProblem-{}-{}-{}-{}'.format(
+            str(self.ydim), str(self.nineq), str(self.neq), str(self.num)
+        )
+
+
+    @property
+    def X(self):
+        return self._X
+
+    @property
+    def G(self):
+        return self._G.to(torch.float64)
+
+    @property
+    def h(self):
+        return self._h
+
+
+    @property
+    def R(self):
+        return self._R
+
+    @property
+    def R_root(self):
+        return self._R_root
+
+    @property
+    def R_root_trans(self):
+        return self._R_root_trans
+
+    @property
+    def merge(self):
+        return torch.cat((self.X, self.R_root, self.R_root_trans), dim=1)
+
+    @property
+    def Y(self):
+        return self._Y
+
+    @property
+    def partial_vars(self):
+        return self._partial_vars
+
+    @property
+    def other_vars(self):
+        return self._other_vars
+
+    @property
+    def partial_unknown_vars(self):
+        return self._partial_vars
+
+    @property
+    def G_np(self):
+        return self.G.detach().cpu().numpy()
+
+
+    @property
+    def h_np(self):
+        return self.h.detach().cpu().numpy()
+
+    @property
+    def R_np(self):
+        return self.R.detach().cpu().numpy()
+
+    @property
+    def R_root_np(self):
+        return self.R_root.detach().cpu().numpy()
+
+    @property
+    def R_root_trans_np(self):
+        return self.R_root_trans.detach().cpu().numpy()
+
+    @property
+    def X_np(self):
+        return self.X.detach().cpu().numpy()
+
+    @property
+    def Y_np(self):
+        return self.Y.detach().cpu().numpy()
+
+    @property
+    def xdim(self):
+        return self._xdim
+
+    @property
+    def ydim(self):
+        return self._ydim
+
+    @property
+    def num(self):
+        return self._num
+
+    @property
+    def shuffle_idx(self):
+        np.random.seed(3)
+        indices = np.arange(self.num)
+        np.random.shuffle(indices)
+        return indices
+
+    @property
+    def neq(self):
+        return self._neq
+
+    @property
+    def nknowns(self):
+        return self._nknowns
+
+    @property
+    def nineq(self):
+        return self._nineq
+
+    @property
+    def valid_frac(self):
+        return self._valid_frac
+
+    @property
+    def test_frac(self):
+        return self._test_frac
+
+    @property
+    def train_frac(self):
+        return 1 - self.valid_frac - self.test_frac
+
+    @property
+    def trainX(self):
+        # X = self.merge
+        trainX = torch.cat((self.X[self.shuffle_idx][:int(self.num * self.train_frac)], self.R_root[self.shuffle_idx][:int(self.num * self.train_frac)], self.R_root_trans[self.shuffle_idx][:int(self.num * self.train_frac)]), dim=1)
+        return trainX
+        # return self.X[self.shuffle_idx][:int(self.num * self.train_frac)]
+
+    @property
+    def validX(self):
+        return torch.cat((self.X[self.shuffle_idx][int(self.num * self.train_frac):int(self.num * (self.train_frac + self.valid_frac))], self.R_root[self.shuffle_idx][int(self.num * self.train_frac):int(self.num * (self.train_frac + self.valid_frac))], self.R_root_trans[self.shuffle_idx][int(self.num * self.train_frac):int(self.num * (self.train_frac + self.valid_frac))]), dim=1)
+
+    @property
+    def testX(self):
+        return torch.cat((self.X[self.shuffle_idx][int(self.num * (self.train_frac + self.valid_frac)):], self.R_root[self.shuffle_idx][int(self.num * (self.train_frac + self.valid_frac)):], self.R_root_trans[self.shuffle_idx][int(self.num * (self.train_frac + self.valid_frac)):]),dim = 1)
+
+    @property
+    def trainY(self):
+        return self.Y[self.shuffle_idx][:int(self.num * self.train_frac)]
+
+    @property
+    def validY(self):
+        return self.Y[self.shuffle_idx][int(self.num * self.train_frac):int(self.num * (self.train_frac + self.valid_frac))]
+
+    @property
+    def testY(self):
+        return self.Y[self.shuffle_idx][int(self.num * (self.train_frac + self.valid_frac)):]
+
+    @property
+    def device(self):
+        return self._device
+
+    def obj_fn(self, X , Y):
+        # R_root = self.R_root[idx,:]
+        # R_root_trans = self.R_root_trans[idx,:]
+
+        R_root = X[:,33:36]
+        R_root_trans = X[:,36:39]
+        X = X[:, :33]
+
+        self.ret_pro = Retargeting_h1(self.R, R_root, R_root_trans, self.idx)
+        X = X.view(X.shape[0], 11 , 3)
+        Y = Y[None,:, :, None]
+        loss = self.ret_pro.loss(X,Y)
+
+        return loss
+
+    def eq_resid(self, X, Y):
+        return torch.zeros_like(Y)
+        # raise NotImplementedError
+
+    # def ineq_resid(self, X, Y):
+    #     return Y @ self.G.T - self.h.T
+
+    def ineq_dist(self, X, Y):
+        X = X[:, :33]
+        resids = self.ineq_resid(X, Y)
+        return torch.clamp(resids, 0)
+
+    def eq_grad(self, X, Y):
+        return torch.zeros_like(Y)
+        # raise NotImplementedError
+    def ineq_resid(self, X, Y):
+        return torch.cat((Y@self.G.T - self.h.T, (torch.sum(Y*Y, dim = 1)-4).reshape(-1,1)), dim=1)
+    def ineq_grad(self, X, Y):
+        return 2 * (torch.clamp(Y @ (self.G.T) - self.h.T, 0) @ self.G+Y)
+
+    def ineq_partial_grad(self, X, Y):
+        # grad = torch.clamp(Y @ self.G.T - self.h, 0) @ self._M
+        # Y = torch.zeros(X.shape[0], self.ydim, device=self.device)
+        # Y[:, self.partial_vars] = grad
+        # Y[:, self.other_vars] = - (grad @ self._A_partial.T) @ self._A_other_inv.T
+
+        # return Y
+        raise NotImplementedError
+
+    def process_output(self, X, Y):
+
+        lower_bounds = -1*self.h[:19,:].T
+        upper_bounds = self.h[19:,:].T
+        Y = Y * (upper_bounds - lower_bounds) + lower_bounds
+        return Y
+
+    def complete_partial(self, X, Y):
+        # Y = torch.zeros(X.shape[0], self.ydim, device=self.device)
+        # Y[:, self.partial_vars] = Z
+        # Y[:, self.other_vars] = (X - Z @ self._A_partial.T) @ self._A_other_inv.T
+        # return Y
+        lower_bounds = -1 * self.h[:19, :].T
+        upper_bounds = self.h[19:, :].T
+        Y = Y * (upper_bounds - lower_bounds) + lower_bounds
+        return Y
+
+    def unnorm(self, Y):
+        lower_bounds = -1 * self.h[:19, :].T
+        upper_bounds = self.h[19:, :].T
+
+        return ((Y - lower_bounds) / (upper_bounds - lower_bounds) - 0.5) *2
+
+    def set_w(self, wc, wo):
+        self.wc = wc
+        self.wo = wo
+
+    def set_buffer(self, buffer):
+        self.buffer = buffer
+
+    @torch.no_grad()
+    def _eval_func(self, X, Y_partial, Y_best=None, obj_best=None, idx=None, extra=False, extra2=False):
+        bonus0 = (Y_partial - self.buffer.get(idx)).norm(dim=1, keepdim=True)
+        # bonus = (Y_partial - Y_best).norm(dim=1, keepdim=True)
+        Y_partial = Y_partial * 0.5 + 0.5
+        Y = self.complete_partial(X, Y_partial)
+        resids = self.ineq_resid(X, Y)
+        gap = obj_best - self.obj_fn(X, Y).view(-1, 1)
+        dist = torch.clamp(resids, -0.00).sum(dim=1, keepdim=True)
+        # dist = resids.max(dim=1, keepdim=True)[0]
+        judge = (resids.max(dim=1, keepdim=True)[0] <= 1e-5)
+        return 0.1 * bonus0 * judge * (not extra) * extra2 + 1.0 * torch.exp(
+            gap) * judge * extra - dist  # + self.wc * judge + self.wo * judge * torch.sigmoid(-self.obj_fn(Y)).view(-1,
+
+    @torch.no_grad()  # 1)  # self.wc * torch.log(-resids.sum(dim=1, keepdim=True) * judge + 1) - self.wo * judge * self.obj_fn(Y).view(-1,1)
+    def _eval_func_eval(self, X, Y_partial):
+        Y_partial = Y_partial * 0.5 + 0.5
+        Y = self.complete_partial(X, Y_partial)
+        resids = self.ineq_resid(X, Y)
+        dist = torch.clamp(resids, -0.0).sum(dim=1, keepdim=True)
+        judge = (dist <= 1e-5)
+
+        return -dist + judge * torch.sigmoid(-self.obj_fn(X, Y).view(-1,
+                                                                  1))  # + self.wc * torch.log(-resids.sum(dim=1, keepdim=True) * judge + 1) - self.wo * judge * self.obj_fn(Y).view(-1,1)
+
+    def _cons_region(self, X, Y):
+        resids = self.ineq_resid(X, Y)
+        return resids <= 0
+
+    def opt_solve(self, X, tol=1e-4, max_iter=1000):
+
+        if self.solver_type == 'ipopt':
+            # G, P_t, h = self.G_np, self.P_np, self.h_np
+            G, h, R, R_root, R_root_trans, idx = self.G_np, self.h_np, self.R_np, self.R_root_np, self.R_root_trans_np, self.idx
+            X_np = X.detach().cpu().numpy()
+
+            p, total_time, parallel_time = self.ipopt_solver( G,h, R, R_root, R_root_trans, idx, X_np)
+
+        else:
+            raise NotImplementedError
+
+        if isinstance(p, np.ndarray):
+            sols = p
+        else:
+            sols = p.detach().cpu().numpy()
+
+        # sols = np.array(p.detach().cpu().numpy())
+
+        return sols, total_time, parallel_time
+
+    def ipopt_solver(self, G,h, R, R_root, R_root_trans, idx, X_np, tol=1e-4):
+        P = []
+        total_time = 0
+        n = 0
+        p_final = None
+        for X_i, R_root_i, R_root_trans_i in zip(X_np, R_root, R_root_trans):
+            pos = torch.tensor(X_i)
+            R_root_i = torch.tensor(R_root_i).unsqueeze(0)
+            R_root_trans_i = torch.tensor(R_root_trans_i).unsqueeze(0)
+            # N_0 = 1.0
+            dim = 19
+
+            # initial p_0
+            # p_0 = np.full(dim, P_t / dim)
+            # p_0 = np.random.rand(19)*0.4
+            if p_final is None:
+                p_0 = np.zeros(19)
+            else:
+                p_0 = p_final
+
+            # p_0 = np.zeros(19)
+
+
+
+
+            # lb = np.zeros(dim)
+            # ub = np.full(dim, np.inf)
+
+            # lb = -np.infty * np.ones(p_0.shape)
+            # ub = np.infty * np.ones(p_0.shape)
+
+            lb = h[:19,:].squeeze()
+            ub = h[19:,:].squeeze()
+
+            # print(G.shape[0])
+            # cl = -np.inf * np.ones(G.shape[0])
+            # cu = h
+
+
+            nlp = cyipopt.Problem(
+                n=dim,
+                m=0,
+                problem_obj=Retargeting_ipopt(G,R, R_root_i, R_root_trans_i, idx, pos),
+                lb=lb,
+                ub=ub,
+            )
+            nlp.add_option('tol', tol)
+            nlp.add_option('max_iter', 200)
+            nlp.add_option('print_level', 5)
+            # nlp.add_option('mu_init', 0.01)
+            nlp.add_option('max_soc',8)
+            nlp.add_option('alpha_red_factor', 0.5)
+            nlp.add_option('mu_strategy', 'adaptive')
+            nlp.add_option('acceptable_tol',0.1)
+            nlp.add_option('acceptable_obj_change_tol',0.1)
+            # nlp.addOption()
+            # nlp.add_option('nlp_scaling_method', 'gradient-based')
+            # nlp.add_option('linear_solver', 'ma57')
+            # nlp.add_option('hessian_approximation', 'limited-memory')
+
+            start_time = time.time()
+            p_final, info = nlp.solve(p_0)
+            print(p_final)
+            end_time = time.time()
+            P.append(p_final)
+            print(end_time - start_time)
+            total_time += (end_time - start_time)
+            n += 1
+
+        return np.array(P), total_time, total_time / n
+
+    def calc_Y(self):
+        Y, t, _ = self.opt_solve(self.X)
+        feas_mask = ~np.isnan(Y).all(axis=1)
+        self._num = feas_mask.sum()
+        self._X = self._X[feas_mask]
+        self._Y = torch.tensor(Y[feas_mask])
+        return Y, t
+
+
+class Retargeting_ipopt(object):
+    def __init__(self, G,  R, R_root, R_root_trans, idx, pos):
+        self.pos = pos.reshape(1, 11, 3)
+        self.G = G
+        self.R = R
+        self.R_root = R_root
+        self.R_root_trans = R_root_trans
+        self.idx = idx
+        self.var_dim = G.shape[1]
+        self.ret_pro = Retargeting_h1(self.R, self.R_root, self.R_root_trans, self.idx)
+
+        # self.loss = None
+        # self.grad = None
+
+    def objective(self, p):
+        # input:  p   d*1 array
+        # output: loss  int
+        p = torch.from_numpy(p).unsqueeze(0)[:,None,:, None]
+        p.requires_grad_(True)
+
+        loss = self.ret_pro.loss(self.pos, p)
+        # self.loss = loss
+        # self.grad = grad
+        return loss.item()
+
+    # def gradient_check(self, p, epsilon=1e-5):
+    #     grad_numerical = np.zeros_like(p)
+    #     for i in range(len(p)):
+    #         p_plus = p.copy()
+    #         p_minus = p.copy()
+    #         p_plus[i] += epsilon
+    #         p_minus[i] -= epsilon
+    #
+    #
+    #         # p_plus = p_plus.
+    #         # p_minus = p_minus.unsqueeze(0)[:, None, :, None]
+    #         loss_plus = self.objective(p_plus)
+    #         loss_minus = self.objective(p_minus)
+    #
+    #
+    #         grad_numerical[i] = (loss_plus - loss_minus) / (2 * epsilon)
+    #
+    #     # print('grad_numerical', grad_numerical)
+    #
+    #     # grad_autodiff = self.gradient(p)
+    #
+    #
+    #     # diff = np.linalg.norm(grad_numerical - grad_autodiff)
+    #     # print("Gradient difference:", diff)
+    #     return grad_numerical
+
+    def gradient(self, p):
+        # input:  p   d*1 array
+        # output: grad d*1 array
+
+        # grad_check = self.gradient_check(p)
+
+        p = torch.from_numpy(p).unsqueeze(0)[:,None,:, None]
+        p.requires_grad_(True)
+        # if p.grad is not None:
+        #     p.grad.zero_()
+
+        grad = self.ret_pro.grad(self.pos, p)
+        grad = grad.squeeze().detach().cpu().numpy()
+        # print('grad',grad)
+
+        # print('grad_check',grad_check)
+        return grad
+
+        # return self.grad.squeeze().numpy()
+
+    def constraints(self, p):
+        # return self.G @ p
+        return np.array[[]]
+
+    def jacobian(self, p):
+        # return self.G.flatten()
+        return np.array[[]]
+
+#############################################
+##   Power allocation optimization problem  #
+#############################################
+class PowerAllocationOptimizationProblem:
+    """
+    \max_{\{p_{1},\ldots,p_{M}\}} C = \sum_{m=1}^{M} \log_{2}\left(1 + g_{m}p_{m}\right)
+
+    s.t. p_{m} \geq 0, & \forall m = 1, 2, \ldots, M \\
+            \sum_{m=1}^{M} p_{m} \leq P_{T}
+
+    """
+
+    def __init__(self, X, P_t, G, h, lambda_m, mu, valid_frac=0.0833, test_frac=0.0833):
+        self._X = torch.tensor(X)
+        self._P_t = torch.tensor(P_t)
+        self._G = torch.tensor(G)
+        self._h = torch.tensor(h)
+        self._Y = None
+        self._xdim = X.shape[1]
+        self._ydim = X.shape[1]
+        self._num = X.shape[0]
+        self._neq = 0
+        self._nineq = G.shape[0]
+
+        self._lambda_m = torch.tensor(lambda_m)
+        self._mu = torch.tensor(mu)
+        self._nknowns = 0
+        self._valid_frac = valid_frac
+        self._test_frac = test_frac
+        det = 0
+        # self.solver_type = 'lagrange'
+        # self.solver_type = 'waterfilling'
+        self.solver_type = 'ipopt'
+
+        self._partial_vars = np.arange(self._ydim)
+        self._other_vars = np.setdiff1d(np.arange(self.ydim), self._partial_vars)
+        self._partial_unknown_vars = self._partial_vars
+
+        ### For Pytorch
+        self._device = None
+
+    def __str__(self):
+        return 'PowerProblem-{}-{}-{}-{}'.format(
+            str(self.ydim), str(self.nineq), str(self.neq), str(self.num)
+        )
+
+
+
+    @property
+    def P_t(self):
+        return self._P_t
+
+    @property
+    def X(self):
+        return self._X
+
+    @property
+    def G(self):
+        return self._G
+
+    @property
+    def h(self):
+        return self._h
+
+    @property
+    def lambda_m(self):
+        return self._lambda_m
+
+    @property
+    def mu(self):
+        return self._mu
+
+    @property
+    def Y(self):
+        return self._Y
+
+    # @property
+    # def partial_vars(self):
+    #     return self._partial_vars
+    #
+    # @property
+    # def other_vars(self):
+    #     return self._other_vars
+    #
+    # @property
+    # def partial_unknown_vars(self):
+    #     return self._partial_vars
+
+    @property
+    def G_np(self):
+        return self.G.detach().cpu().numpy()
+
+    @property
+    def P_np(self):
+        return self.P_t.detach().cpu().numpy()
+
+    @property
+    def h_np(self):
+        return self.h.detach().cpu().numpy()
+
+    @property
+    def X_np(self):
+        return self.X.detach().cpu().numpy()
+
+    @property
+    def Y_np(self):
+        return self.Y.detach().cpu().numpy()
+
+    @property
+    def xdim(self):
+        return self._xdim
+
+    @property
+    def ydim(self):
+        return self._ydim
+
+    @property
+    def num(self):
+        return self._num
+
+    @property
+    def neq(self):
+        return self._neq
+
+    @property
+    def partial_vars(self):
+        return self._partial_vars
+
+    @property
+    def other_vars(self):
+        return self._other_vars
+
+    @property
+    def partial_unknown_vars(self):
+        return self._partial_unknown_vars
+
+    @property
+    def nknowns(self):
+        return self._nknowns
+
+    @property
+    def nineq(self):
+        return self._nineq
+
+    @property
+    def valid_frac(self):
+        return self._valid_frac
+
+    @property
+    def test_frac(self):
+        return self._test_frac
+
+    @property
+    def train_frac(self):
+        return 1 - self.valid_frac - self.test_frac
+
+    @property
+    def trainX(self):
+        return self.X[:int(self.num * self.train_frac)]
+
+    @property
+    def validX(self):
+        return self.X[int(self.num*self.train_frac):int(self.num*(self.train_frac + self.valid_frac))]
+
+    @property
+    def testX(self):
+        return self.X[int(self.num*(self.train_frac + self.valid_frac)):]
+
+    @property
+    def trainY(self):
+        return self.Y[:int(self.num*self.train_frac)]
+
+    @property
+    def validY(self):
+        return self.Y[int(self.num*self.train_frac):int(self.num*(self.train_frac + self.valid_frac))]
+
+    @property
+    def testY(self):
+        return self.Y[int(self.num*(self.train_frac + self.valid_frac)):]
+
+    @property
+    def device(self):
+        return self._device
+
+    def obj_fn(self,X, Y):
+        # Y = torch.clamp(Y,  1e-6)
+        return -((1 / torch.log(torch.tensor(2.0))) * torch.log(1 + X*Y)).sum(dim=1)
+
+    def set_w(self, wc, wo):
+        self.wc = wc
+        self.wo = wo
+
+    def set_buffer(self, buffer):
+        self.buffer = buffer
+
+    @torch.no_grad()
+    def _eval_func(self, X, Y_partial, Y_best=None, obj_best=None, idx=None, extra=False, extra2=False):
+        bonus0 = (Y_partial - self.buffer.get(idx)).norm(dim=1, keepdim=True)
+        # bonus = (Y_partial - Y_best).norm(dim=1, keepdim=True)
+        Y_partial = Y_partial * 0.5 + 0.5
+        Y = self.complete_partial(X, Y_partial)
+        resids = self.ineq_resid(X, Y)
+        gap = obj_best - self.obj_fn(X, Y).view(-1, 1)
+        dist = torch.clamp(resids, -0.00).sum(dim=1, keepdim=True)
+        # dist = resids.max(dim=1, keepdim=True)[0]
+        judge = (resids.max(dim=1, keepdim=True)[0] <= 1e-5)
+        return 0.1 * bonus0 * judge * (not extra) * extra2 + 1.0 * torch.exp(
+            gap) * judge * extra - dist  # + self.wc * judge + self.wo * judge * torch.sigmoid(-self.obj_fn(Y)).view(-1,
+
+    @torch.no_grad()  # 1)  # self.wc * torch.log(-resids.sum(dim=1, keepdim=True) * judge + 1) - self.wo * judge * self.obj_fn(Y).view(-1,1)
+    def _eval_func_eval(self, X, Y_partial):
+        Y_partial = Y_partial * 0.5 + 0.5
+        Y = self.complete_partial(X, Y_partial)
+        resids = self.ineq_resid(X, Y)
+        dist = torch.clamp(resids, -0.0).sum(dim=1, keepdim=True)
+        judge = (dist <= 1e-5)
+
+        return -dist + judge * torch.sigmoid(-self.obj_fn(X, Y).view(-1,
+                                                                  1))  # + self.wc * torch.log(-resids.sum(dim=1, keepdim=True) * judge + 1) - self.wo * judge * self.obj_fn(Y).view(-1,1)
+
+    def _cons_region(self, X, Y):
+        resids = self.ineq_resid(X, Y)
+        return resids <= 0
+
+    def eq_resid(self, X, Y):
+        return torch.zeros_like(Y)
+        # raise NotImplementedError
+
+    def ineq_resid(self, X, Y):
+        return Y @ self.G.T - self.h
+
+    def ineq_dist(self, X, Y):
+        resids = self.ineq_resid(X, Y)
+        return torch.clamp(resids, 0)
+
+    def eq_grad(self, X, Y):
+        return torch.zeros_like(Y)
+        # raise NotImplementedError
+
+    def ineq_grad(self, X, Y):
+
+        # return torch.ger(2 * torch.clamp(Y @ self.G.T - (X[:,self.ydim:]).squeeze(), 0), self.G)
+        return 2 * torch.clamp(Y @ self.G.T - self.h, 0) @ self.G
+
+    def ineq_partial_grad(self, X, Y):
+        # grad = torch.clamp(Y @ self.G.T - self.h, 0) @ self._M
+        # Y = torch.zeros(X.shape[0], self.ydim, device=self.device)
+        # Y[:, self.partial_vars] = grad
+        # Y[:, self.other_vars] = - (grad @ self._A_partial.T) @ self._A_other_inv.T
+
+        # return Y
+        raise NotImplementedError
+
+
+    def process_output(self, X, Y):
+        return Y*self.P_t
+
+    def complete_partial(self, X, Y):
+        # Y = torch.zeros(X.shape[0], self.ydim, device=self.device)
+        # Y[:, self.partial_vars] = Z
+        # Y[:, self.other_vars] = (X - Z @ self._A_partial.T) @ self._A_other_inv.T
+        # return Y
+        return Y * self.P_t
+
+    def unnorm(self, Y):
+        return (Y / self.P_t - 0.5) * 2
+
+
+    @property
+    def lambda_m_np(self):
+        return self.lambda_m.detach().cpu().numpy()
+
+    def water_batch(self, G_m, P_t):
+        p = None
+        experts = []
+        sumdata_rates = []
+        subexperts = []
+
+        for s, total_power in zip(G_m, P_t):
+            a = total_power
+            g_n = s
+            N_0 = 1.0
+
+            L = torch.tensor(0.0, dtype=torch.float32)
+            U = a + N_0 * torch.sum(1 / (g_n + 1e-6))  # Initial upper bound
+
+            precision = 1e-6
+            # error = 1e6
+            while U - L > precision:
+                alpha_bar = (L + U) / 2
+                p_n = torch.maximum(alpha_bar - N_0 / (g_n + 1e-6), torch.tensor(0.0))
+                P = torch.sum(p_n)
+
+                if P > a:
+                    U = alpha_bar
+                else:
+                    L = alpha_bar
+                # error = U-L
+            # Final power allocation
+            p_n_final = torch.maximum(alpha_bar - N_0 / (g_n + 1e-6), torch.tensor(0.0))
+            p_n_final = p_n_final.unsqueeze(0)
+            # Calculate data rate
+            SNR = g_n * p_n_final / N_0
+            data_rate = torch.log2(1 + SNR)
+            sumdata_rate = torch.sum(data_rate)
+
+            # Expert and suboptimal power allocation
+            expert = p_n_final / total_power
+            subexpert = p_n_final / total_power + torch.normal(0, 0.1, size=p_n_final.shape)
+
+            if p is None:
+                p = p_n_final
+            else:
+                p = torch.cat((p, p_n_final), dim=0)  # Use torch.cat instead of torch.stack
+
+            experts.append(expert)
+            sumdata_rates.append(sumdata_rate)
+            subexperts.append(subexpert)
+
+        return p, experts, sumdata_rates, subexperts
+
+    def opt_solve(self,X, tol=1e-4, max_iter=1000):
+
+        if self.solver_type == 'lagrange':
+            lambda_m = self.lambda_m
+            # p_list = np.zeros(self.Gdim)
+
+            start_time = time.time()
+            for _ in range(max_iter):
+                p = torch.maximum(1 / (lambda_m * torch.log(torch.tensor(2.0))) - 1 / self.G_m, torch.tensor(0.0))
+                total_power = torch.sum(p)
+                if abs(total_power - self.P_t) < tol:
+                    break
+                if total_power < self.P_t:
+                    lambda_m *= 0.9
+                else:
+                    lambda_m *= 1.1
+            end_time = time.time()
+            total_time = end_time - start_time
+            parallel_time = total_time
+
+        elif self.solver_type == 'waterfilling':
+            mu = self.mu
+            # p_list = np.zeros(self.Gdim)
+            start_time = time.time()
+            p, _, _, _ = self.water_batch(self.G_m, self.P_t)
+            end_time = time.time()
+            total_time = end_time - start_time
+            parallel_time = total_time
+
+        elif self.solver_type == 'ipopt':
+            G, P_t, h = self.G_np[-1,:].reshape(1,-1), self.P_np, self.h_np[-1]
+            X_np = X.detach().cpu().numpy()
+
+            p, total_time, parallel_time = self.ipopt_solver(G, P_t, h, X_np)
+
+        else:
+            raise NotImplementedError
+
+        if isinstance(p, np.ndarray):
+            sols = p
+        else:
+            sols = p.detach().cpu().numpy()
+
+        # sols = np.array(p.detach().cpu().numpy())
+
+        return sols, total_time, parallel_time
+
+    def ipopt_solver(self, G, P_t, h, X_np, tol=1e-7):
+        P = []
+        total_time = 0
+        n = 0
+        for X_i in X_np:
+            g_m = X_i
+            N_0 = 1.0
+            dim = g_m.shape[0]
+
+            # initial p_0
+            p_0 = np.full(dim, P_t / dim)
+
+            # lb = np.zeros(dim)
+            # ub = np.full(dim, np.inf)
+
+            lb = np.zeros(p_0.shape)
+            ub = P_t * np.ones(p_0.shape)
+
+            # print(G.shape[0])
+            cl = -np.inf * np.ones(G.shape[0])
+            cu = np.array(h).reshape(1,-1)
+
+            nlp = cyipopt.Problem(
+                n=dim,
+                m=1,
+                problem_obj=PowerAllocation_ipopt(g_m, G),
+                lb=lb,
+                ub=ub,
+                cl=cl,
+                cu=cu
+            )
+            nlp.addOption('tol', tol)
+            nlp.addOption('print_level', 0)
+
+            start_time = time.time()
+            p_final, info = nlp.solve(p_0)
+            end_time = time.time()
+            P.append(p_final)
+            total_time += (end_time - start_time)
+            n += 1
+
+        return np.array(P), total_time, total_time / n
+
+    def calc_Y(self):
+        Y, t, _ = self.opt_solve(self.X)
+        feas_mask = ~np.isnan(Y).all(axis=1)
+        self._num = feas_mask.sum()
+        self._X = self._X[feas_mask]
+        self._Y = torch.tensor(Y[feas_mask])
+        return Y, t
+
+
+class PowerAllocation_ipopt(object):
+    def __init__(self, g_m, G):
+        self.g_m = g_m
+        self.G = G
+        self.var_dim = g_m.shape[0]
+
+    def objective(self, p):
+        return -np.sum(1 / np.log(2) * np.log(1 + self.g_m * p))
+
+    def gradient(self, p):
+        return -1 / np.log(2) * self.g_m / (1 + self.g_m * p)
+
+    def constraints(self, p):
+        return self.G@p
+
+    def jacobian(self, p):
+        return self.G.flatten()
