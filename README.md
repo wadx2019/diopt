@@ -1,4 +1,4 @@
-# DiOpt: Self-supervised Diffusion for Constrained Optimization
+# Exploring the Boundary of Diffusion-based Methods for Solving Constrained Optimization
 
 ## Instruction
 
