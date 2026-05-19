@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 try:
     import waitGPU
     #
@@ -22,21 +22,19 @@ import time
 from setproctitle import setproctitle
 import os
 import argparse
-
+import copy
 from utils import my_hash, str_to_bool
 import default_args
 
 from diffopt import DiffOpt
-from diffusion import eps
-
 
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 
 def main():
     parser = argparse.ArgumentParser(description='DC3')
-    parser.add_argument('--probType', type=str, default='PowerAllocation',
-                        choices=['simple', 'nonconvex', 'acopf57', "Retargeting"], help='problem type')
+    parser.add_argument('--probType', type=str, default='acopf57',
+                        choices=['simple', 'nonconvex', 'acopf57', 'acopf118'], help='problem type')
     parser.add_argument('--simpleVar', type=int,
                         help='number of decision vars for simple problem')
     parser.add_argument('--simpleIneq', type=int,
@@ -63,18 +61,6 @@ def main():
                         help='hidden layer size for neural network')
     parser.add_argument('--softWeight', type=float,
                         help='total weight given to constraint violations in loss')
-    parser.add_argument('--PowerVar', type=int,
-        help='number of decision vars for PowerAllocation problem')
-    parser.add_argument('--PowerEx', type=int,
-        help='total number of datapoints for PowerAllocation problem')
-    parser.add_argument('--RetargetVar', type=int,
-                        help='number of decision vars for PowerAllocation problem')
-    parser.add_argument('--RetargetEx', type=int,
-                        help='total number of datapoints for PowerAllocation problem')
-    parser.add_argument('--RetargetIneq', type=int,
-                        help='number of inequality constraints for Retargeting problem')
-    parser.add_argument('--RetargetEq', type=int,
-                        help='number of equality constraints for Retargeting problem')
     parser.add_argument('--softWeightEqFrac', type=float,
                         help='fraction of weight given to equality constraints (vs. inequality constraints) in loss')
     parser.add_argument('--useCompl', type=str_to_bool,
@@ -110,9 +96,9 @@ def main():
                         help="Diffusion, VAE or MLP")
     parser.add_argument("--beta_schedule", type=str, default="cosine", metavar='S',
                         help="linear, cosine or vp")
-    parser.add_argument('--n_timesteps', type=int, default=20, metavar='N',
+    parser.add_argument('--n_timesteps', type=int, default=5, metavar='N',
                         help='diffusion timesteps (default: 20)')
-    parser.add_argument('--diffusion_lr', type=float, default=0.0005, metavar='G',
+    parser.add_argument('--diffusion_lr', type=float, default=0.0003, metavar='G',
                         help='diffusion learning rate (default: 0.0001)')
 
     parser.add_argument('--action_lr', type=float, default=0.03, metavar='G',
@@ -173,12 +159,8 @@ def main():
             args['nonconvexVar'], args['nonconvexIneq'], args['nonconvexEq'], args['nonconvexEx']))
     elif prob_type == 'acopf57':
         filepath = os.path.join('datasets', 'acopf', 'acopf57_dataset')
-    elif prob_type == 'PowerAllocation':
-        filepath = os.path.join('datasets', 'PowerAllocation', "random_power_dataset_var{}_ex{}".format(
-            args['PowerVar'], args['PowerEx']))
-    elif prob_type == 'Retargeting':
-        filepath = os.path.join('datasets', 'ret_problem', "Retargeting_dataset_var{}_ineq{}_eq{}_ex{}_v3".format(
-            args['RetargetVar'], args['RetargetIneq'], args['RetargetEq'], args['RetargetEx']))
+    elif prob_type == 'acopf118':
+        filepath = os.path.join('datasets', 'acopf', 'acopf118_dataset')
     else:
         raise NotImplementedError
 
@@ -202,15 +184,16 @@ def main():
 
     data.set_w(args_v.wc, args_v.wo)
     buffer = Buffer(data, len(data.trainX))
+    buffer.reset(data.unnorm(copy.deepcopy(data.trainY[:, data.partial_unknown_vars])), copy.deepcopy(data.trainY))
     data.set_buffer(buffer)
+    # print(data._xdim, data._ydim - data.nknowns - data.neq)
     optimizer = DiffOpt(args_v, buffer, data, data._xdim, data._ydim - data.nknowns - data.neq, data._eval_func, DEVICE)
     # Run method
-    buffer.reset(data.unnorm(data.trainY))
     train_diff(optimizer, data, args, save_dir)
 
+
 def train_diff(optimizer, data, args, save_dir):
-    global eps
-    eps[0] = 0.0
+
     solver_step = args['lr']
     nepochs = args['epochs']
     batch_size = args['batchSize']
@@ -220,27 +203,27 @@ def train_diff(optimizer, data, args, save_dir):
     test_dataset = TensorDataset(data.testX)
 
 
+
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     valid_loader = DataLoader(valid_dataset, batch_size=len(valid_dataset))
     print(len(valid_dataset), len(train_dataset))
     test_loader = DataLoader(test_dataset, batch_size=len(test_dataset))
     train_sample = optimizer.train_sample
     optimizer.train_sample = 1
-    stats = {}
-    print(data.obj_fn(torch.tensor(data.validX), torch.tensor(data.validY)).mean())
     viol = float("inf")
     val = float("inf")
+    stats = {}
     for i in range(nepochs*10):
         if i==1000:
-            eps[0] = 0.0
             optimizer.train_sample = train_sample
             data.buffer.viol = -float('inf') * torch.ones_like(data.buffer.viol)
             data.buffer.Y = torch.zeros_like(data.buffer.Y)
+            data.buffer.Y_com = torch.zeros_like(data.buffer.Y_com)
         epoch_stats = {}
-        print("op:", (optimizer.buffer.viol>=-1e-5).sum().item()/len(optimizer.buffer))
+        print("op:", (optimizer.buffer.viol>=1e-5).sum().item()/len(optimizer.buffer))
 
         # Get valid loss
-        if i % 2 == 0:
+        if i % 5 == 0:
             for Xvalid, Yvalid in valid_loader:
                 Xvalid = Xvalid.to(DEVICE)
                 Yvalid = Yvalid.to(DEVICE)
@@ -262,7 +245,7 @@ def train_diff(optimizer, data, args, save_dir):
         # Get train loss
         for Xtrain, Ytrain, idx in train_loader:
             Xtrain = Xtrain.to(DEVICE)
-            obj_best = data.obj_fn(Xtrain, Ytrain.to(DEVICE)).view(-1,1)
+            obj_best = data.obj_fn(Ytrain.to(DEVICE)).view(-1,1)
             Ytrain_partial = Ytrain.to(DEVICE)[:, data.partial_unknown_vars]
             start_time = time.time()
             train_loss = optimizer.train(Xtrain, Ytrain_partial, obj_best, idx=idx, extra=True, extra2=False)
@@ -270,9 +253,9 @@ def train_diff(optimizer, data, args, save_dir):
             dict_agg(epoch_stats, 'train_loss', np.array(train_loss).reshape(1))
             dict_agg(epoch_stats, 'train_time', train_time, op='sum')
 
-        if i % 2 == 0:
+        if i % 5 == 0:
             print(
-                'Epoch {}: train loss {:.4f}, eval {:.4f}({:.4f}), dist {:.4f}, ineq max {:.4f}({:.4f}), ineq mean {:.4f}({:.4f}), ineq num viol {:.4f}({:.4f}), eq max {:.4f}({:.4f}), time {:.4f}'.format(
+                'Epoch {}: train loss {:.4f}, eval {:.4f}({:.4f}), dist {:.4f}, ineq max {:.4f}({:.4f}), ineq mean {:.4f}({:.4f}), ineq num viol {:.4f}({:.4f}), eq max {:.4f}({:.4f}), eq mean {:.4f}({:.4f}), time {:.4f}'.format(
                     i, np.mean(epoch_stats['train_loss']), np.mean(epoch_stats['valid_eval']),
                     np.std(epoch_stats['valid_eval']),
                     np.mean(epoch_stats['valid_dist']), np.mean(epoch_stats['valid_ineq_max']),
@@ -280,8 +263,9 @@ def train_diff(optimizer, data, args, save_dir):
                     np.mean(epoch_stats['valid_ineq_mean']), np.std(epoch_stats['valid_ineq_mean']),
                     np.mean(epoch_stats['valid_ineq_num_viol_0']), np.std(epoch_stats['valid_ineq_num_viol_0']),
                     np.mean(epoch_stats['valid_eq_max']), np.std(epoch_stats['valid_eq_max']),
+                    np.mean(epoch_stats['valid_eq_mean']),
+                    np.std(epoch_stats['valid_eq_mean']),
                     np.mean(epoch_stats['valid_time'])))
-
             print(
                 'Epoch {}: train loss {:.4f}, eval {:.4f}, dist {:.4f}, ineq max {:.4f}, ineq mean {:.4f}, ineq num viol {:.4f}, eq max {:.4f}, time {:.4f}'.format(
                     i, np.mean(epoch_stats['train_loss']), np.mean(epoch_stats['train2_eval']),
@@ -314,12 +298,8 @@ def train_diff(optimizer, data, args, save_dir):
                     pickle.dump(stats, f)
                 optimizer.save_model(save_dir)
 
-
-    #     with open(os.path.join(save_dir, 'stats.dict'), 'wb') as f:
-    #         pickle.dump(stats, f)
-
-    optimizer.save_model(save_dir)
     return stats
+
 
 # Modifies stats in place
 def dict_agg(stats, key, value, op='concat'):
@@ -335,30 +315,36 @@ def dict_agg(stats, key, value, op='concat'):
 
 class Buffer(object):
     def __init__(self, data, size):
+        self.data = data
         self.viol = -float("inf") * torch.ones(size, 1, device=DEVICE)
         self.Y = torch.zeros(size, data._ydim-data.nknowns-data.neq, device=DEVICE)
         self.Y_pre= torch.zeros(size, data._ydim-data.nknowns-data.neq, device=DEVICE)
         self.size = size
+        self.Y_com = torch.zeros(size, data._ydim, device=DEVICE)
 
     def replace(self, idx, Y_new, viol):
+        viol = self.data._eval_func_eval(self.data.trainX[idx], self.tmp, True)
+        self.Y_com[idx] = torch.where(viol>self.viol[idx], self.tmp, self.Y_com[idx])
         self.Y[idx] = torch.where(viol>self.viol[idx], Y_new, self.Y[idx])
         self.viol[idx] = torch.where(viol>self.viol[idx], viol, self.viol[idx])
     def __getitem__(self, idx):
         return self.Y[idx], self.viol[idx]
+
+    def store(self, tmp):
+        self.tmp = tmp.detach().clone()
 
     def new(self, idx, Y_new):
         self.Y_pre[idx] = Y_new
 
     def get(self, idx):
         return self.Y_pre[idx]
-
     def __len__(self):
         return self.size
 
-    def reset(self, trainY):
+    def reset(self, trainY, full):
+        self.Y_com.copy_(full)
         self.viol.zero_()
         self.Y.copy_(trainY)
-
 
 
 

@@ -157,7 +157,7 @@ class Diffusion(nn.Module):
             action = self.p_sample_loop(state, shape, guidance)
             action.clamp_(-1., 1.)
             q = q_func(state, action)
-            print("rate:", (q>=-1e-5).sum().item()/q.shape[0])
+            # print("rate:", (q>=-1e-5).sum().item()/q.shape[0])
             action = action.view(self.eval_sample, raw_batch_size, -1).transpose(0,1)
             q = q.view(self.eval_sample, raw_batch_size, -1).transpose(0,1)
             action_idx = torch.argmax(q, dim=1, keepdim=True).repeat(1,1,self.action_dim)

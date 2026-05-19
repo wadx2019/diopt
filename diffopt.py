@@ -214,7 +214,7 @@ class DiffOpt(object):
         Ycorr = Ynew = Y
         raw_end_time = time.time()
 
-        print((self.data.ineq_dist(X,Y).max(dim=1, keepdim=True)[0]<=1e-5).sum().item()/X.shape[0], X.shape)
+        # print((self.data.ineq_dist(X,Y).max(dim=1, keepdim=True)[0]<=1e-5).sum().item()/X.shape[0], X.shape)
 
         dict_agg(stats, make_prefix('time'), end_time - start_time, op='sum')
         # dict_agg(stats, make_prefix('loss'), self.eval_func(X, Y_partial).detach().cpu().numpy())
